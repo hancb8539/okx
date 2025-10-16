@@ -2,3 +2,4 @@ requests
 PyQt5
 matplotlib
 mplfinance
+python-dotenv

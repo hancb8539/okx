@@ -10,7 +10,7 @@ import matplotlib.dates as mdates
 import mplfinance as mpf
 
 from items import read_item_file
-from okx_api import get_ticker, get_candlesticks
+from okx_api import get_ticker, get_candlesticks, get_account_balance, get_account_bills, calc_spot_realized_pnl
 from config import GUI_REFRESH_INTERVAL_MS, TIMEZONE
 
 
@@ -87,6 +87,13 @@ class PriceWindow(QtWidgets.QMainWindow):
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
 
+        # 主分頁
+        self.tabs = QtWidgets.QTabWidget(self)
+
+        # ---- 市場頁 ----
+        marketTab = QtWidgets.QWidget(self)
+        marketLayout = QtWidgets.QVBoxLayout()
+
         self.table = QtWidgets.QTableWidget(self)
         self.table.setColumnCount(3)
         self.table.setHorizontalHeaderLabels(["Symbol", "Price", "30m Change"])
@@ -103,7 +110,7 @@ class PriceWindow(QtWidgets.QMainWindow):
         # 圖表標的一覽
         self.symbolLabel = QtWidgets.QLabel("Symbol:")
         self.symbolSelect = QtWidgets.QComboBox()
-        
+
         # K線週期選擇
         self.periodLabel = QtWidgets.QLabel("Period:")
         self.periodSelect = QtWidgets.QComboBox()
@@ -114,7 +121,7 @@ class PriceWindow(QtWidgets.QMainWindow):
         self.timezoneLabel = QtWidgets.QLabel(f"Timezone: {TIMEZONE}")
         self.timezoneLabel.setStyleSheet("color: gray; font-size: 10px;")
 
-        vbox = QtWidgets.QVBoxLayout()
+        vbox = marketLayout
         vbox.addWidget(self.table)
         chartCtl = QtWidgets.QHBoxLayout()
         chartCtl.addWidget(self.symbolLabel)
@@ -146,7 +153,38 @@ class PriceWindow(QtWidgets.QMainWindow):
         ctrl.addWidget(self.statusLabel)
         vbox.addLayout(alertCtl)
         vbox.addLayout(ctrl)
-        central.setLayout(vbox)
+        marketTab.setLayout(vbox)
+
+        # ---- 資產頁 ----
+        assetsTab = QtWidgets.QWidget(self)
+        assetsLayout = QtWidgets.QVBoxLayout()
+
+        self.assetsSummary = QtWidgets.QLabel("Total Equity: -", self)
+        self.assetsTable = QtWidgets.QTableWidget(self)
+        self.assetsTable.setColumnCount(4)
+        self.assetsTable.setHorizontalHeaderLabels(["Currency", "Equity", "Available", "Unrealized PnL"])
+        self.assetsTable.horizontalHeader().setStretchLastSection(True)
+
+        assetsCtrl = QtWidgets.QHBoxLayout()
+        self.assetsRefreshBtn = QtWidgets.QPushButton("Refresh Assets", self)
+        self.assetsStatus = QtWidgets.QLabel("Ready", self)
+        assetsCtrl.addWidget(self.assetsRefreshBtn)
+        assetsCtrl.addStretch(1)
+        assetsCtrl.addWidget(self.assetsStatus)
+
+        assetsLayout.addWidget(self.assetsSummary)
+        assetsLayout.addWidget(self.assetsTable)
+        # 刪除：分幣 realizedTable 與標題
+        assetsLayout.addLayout(assetsCtrl)
+        assetsTab.setLayout(assetsLayout)
+
+        # 加入分頁
+        self.tabs.addTab(marketTab, "Market")
+        self.tabs.addTab(assetsTab, "Assets")
+
+        rootLayout = QtWidgets.QVBoxLayout()
+        rootLayout.addWidget(self.tabs)
+        central.setLayout(rootLayout)
 
         self.inst_ids = read_item_file(os.path.join(os.path.dirname(__file__), "item.txt"))
         self._populate_table()
@@ -158,6 +196,7 @@ class PriceWindow(QtWidgets.QMainWindow):
         self.refreshBtn.clicked.connect(self.refresh)
         self.symbolSelect.currentIndexChanged.connect(self.draw_plot)
         self.periodSelect.currentIndexChanged.connect(self.draw_plot)
+        self.assetsRefreshBtn.clicked.connect(self.refresh_assets)
 
         # 每分鐘自動刷新
         self.timer = QtCore.QTimer(self)
@@ -173,6 +212,7 @@ class PriceWindow(QtWidgets.QMainWindow):
 
         # 啟動時立即查一次
         QtCore.QTimer.singleShot(0, self.refresh)
+        QtCore.QTimer.singleShot(0, self.refresh_assets)
 
     def _populate_table(self):
         self.table.setRowCount(len(self.inst_ids))
@@ -220,6 +260,375 @@ class PriceWindow(QtWidgets.QMainWindow):
     def on_failed(self, err: str):
         self.statusLabel.setText(f"Error: {err}")
         self.refreshBtn.setEnabled(True)
+
+    def draw_plot(self):
+        if not self.inst_ids:
+            return
+        symbol = self.symbolSelect.currentText() if self.symbolSelect.count() else None
+        if not symbol:
+            return
+        
+        period = self.periodSelect.currentText()
+        
+        # 清除當前圖形
+        self.figure.clear()
+        
+        # 獲取K線數據
+        df = get_candlestick_data(symbol, period, 100)
+        
+        if df is not None and not df.empty:
+            try:
+                mpf.plot(df, type='candle', style='charles', 
+                        title=f"{symbol} - {period} Candlestick Chart ({TIMEZONE})",
+                        ylabel="Price (USDT)",
+                        volume=True,
+                        figsize=(6, 4),
+                        fig=self.figure,
+                        datetime_format='%H:%M',
+                        tight_layout=True)
+            except Exception as e:
+                ax = self.figure.add_subplot(111)
+                ax.grid(True, linestyle=":", linewidth=0.5)
+                ax.set_xlabel("Time")
+                ax.set_ylabel("Price")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                if 'close' in df.columns:
+                    ax.plot(df.index, df['close'], linewidth=1.2, color='blue')
+                    ax.set_title(f"{symbol} - {period} (Close Price)")
+                else:
+                    ax.set_title(f"{symbol} - {period} No Data")
+                self.figure.tight_layout(pad=2.0)
+        else:
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, f"{symbol} - {period}\nNo K-line Data", 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_title(f"{symbol} - {period} No Data")
+        self.figure.tight_layout(pad=3.0)
+        self.figure.subplots_adjust(bottom=0.15)
+        self.figure.autofmt_xdate()
+        self.canvas.draw_idle()
+
+    def update_change_column(self):
+        # 針對每個標的，計算相對 30 分鐘前的漲幅百分比
+        if not self.inst_ids:
+            return
+        now = datetime.datetime.now()
+        threshold = now - datetime.timedelta(minutes=30)
+        for row, inst in enumerate(self.inst_ids):
+            series = self.histories.get(inst, [])
+            if not series or len(series) < 2:
+                self.table.setItem(row, 2, QtWidgets.QTableWidgetItem("N/A"))
+                continue
+            # 取得當前價
+            _, current_val = series[-1]
+            # 尋找最接近且不晚於 threshold 的舊資料
+            baseline_val = None
+            last_before_or_at = None
+            for t, v in series:
+                if t <= threshold:
+                    last_before_or_at = v
+                else:
+                    break
+            if last_before_or_at is not None:
+                baseline_val = last_before_or_at
+            else:
+                # 若沒有早於閾值的資料，則以最早一筆作為基準（資料不足 30 分鐘）
+                baseline_val = series[0][1]
+            try:
+                pct = None
+                if baseline_val and baseline_val > 0:
+                    pct = (current_val - baseline_val) / baseline_val * 100.0
+                    text = f"{pct:+.2f}%"
+                else:
+                    text = "N/A"
+            except Exception:
+                text = "N/A"
+                pct = None
+            item = self.table.item(row, 2)
+            if item is None:
+                item = QtWidgets.QTableWidgetItem()
+                self.table.setItem(row, 2, item)
+            item.setText(text)
+            # 顏色標示與提醒
+            default_bg = QtGui.QBrush()
+            if pct is None:
+                item.setBackground(default_bg)
+                continue
+            abs_threshold = self.alertThreshold.value()
+            triggered = abs(pct) >= abs_threshold
+            if triggered:
+                color = QtGui.QColor(220, 20, 60) if pct < 0 else QtGui.QColor(0, 128, 0)
+                item.setBackground(QtGui.QBrush(color).color())
+                self._maybe_alert(inst, pct)
+            else:
+                item.setBackground(default_bg)
+
+    def _maybe_alert(self, inst: str, pct: float):
+        if not self.alertEnable.isChecked():
+            return
+        now = datetime.datetime.now()
+        last_at = self._lastAlertAt.get(inst)
+        if last_at and (now - last_at) < datetime.timedelta(minutes=self._alertCooldownMinutes):
+            return
+        self._lastAlertAt[inst] = now
+        try:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Price Alert",
+                f"{inst} 30-minute change reached {pct:+.2f}%"
+            )
+        except Exception:
+            pass
+    # ===== 資產：GUI 更新 =====
+    def refresh_assets(self):
+        self.assetsRefreshBtn.setEnabled(False)
+        self.assetsStatus.setText("Querying...")
+        self.accWorker = AccountsWorker()
+        self.accWorker.finished.connect(self.on_assets)
+        self.accWorker.failed.connect(self.on_assets_failed)
+        self.accWorker.start()
+
+    def on_assets(self, payload: Dict[str, dict]):
+        def safe_num(val):
+            try:
+                fval = float(val)
+                if abs(fval) < 1e-9:
+                    return "0"
+                return f"{fval:.8f}".rstrip('0').rstrip('.') if '.' in f"{fval:.8f}" else f"{fval:.8f}"
+            except Exception:
+                return "0"
+        try:
+            bal = payload.get("balance", {})
+            # 刪除分幣損益處理，不再 show bills/realizedMap
+            if bal.get("code") == "0":
+                d0 = (bal.get("data") or [{}])[0]
+                totalEq = safe_num(d0.get("totalEq", 0))
+                details = d0.get("details") or []
+                self.assetsSummary.setText(f"Total Equity: {totalEq}")
+                self.assetsTable.setRowCount(len(details))
+                for r, d in enumerate(details):
+                    ccy = d.get("ccy", "")
+                    eq = safe_num(d.get("eq"))
+                    avail = safe_num(d.get("availEq"))
+                    upl = safe_num(d.get("upl"))
+                    self.assetsTable.setItem(r, 0, QtWidgets.QTableWidgetItem(ccy))
+                    self.assetsTable.setItem(r, 1, QtWidgets.QTableWidgetItem(eq))
+                    self.assetsTable.setItem(r, 2, QtWidgets.QTableWidgetItem(avail))
+                    self.assetsTable.setItem(r, 3, QtWidgets.QTableWidgetItem(upl))
+            else:
+                self.assetsSummary.setText("Total Equity: N/A")
+                self.assetsTable.setRowCount(0)
+        finally:
+            self.assetsStatus.setText("Complete")
+            self.assetsRefreshBtn.setEnabled(True)
+
+    def on_assets_failed(self, err: str):
+        self.assetsSummary.setText("Total Equity: N/A")
+        self.assetsTable.setRowCount(0)
+        self.assetsStatus.setText("Error")
+        self.assetsRefreshBtn.setEnabled(True)
+
+    # ===== 資產：查詢執行緒 =====
+class AccountsWorker(QtCore.QThread):
+    finished = QtCore.pyqtSignal(dict)
+    failed = QtCore.pyqtSignal(str)
+
+    def run(self):
+        try:
+            bal = get_account_balance()
+            bills = get_account_bills(limit=100)
+            self.finished.emit({"balance": bal, "bills": bills})
+        except Exception as e:
+            self.failed.emit(str(e))
+
+    def draw_plot(self):
+        if not self.inst_ids:
+            return
+        symbol = self.symbolSelect.currentText() if self.symbolSelect.count() else None
+        if not symbol:
+            return
+        
+        period = self.periodSelect.currentText()
+        
+        # 清除當前圖形
+        self.figure.clear()
+        
+        # 獲取K線數據
+        df = get_candlestick_data(symbol, period, 100)
+        
+        if df is not None and not df.empty:
+            # 使用mplfinance繪製K線圖
+            try:
+                # 使用mplfinance繪製K線圖到當前figure
+                mpf.plot(df, type='candle', style='charles', 
+                        title=f"{symbol} - {period} Candlestick Chart ({TIMEZONE})",
+                        ylabel="Price (USDT)",
+                        volume=True,
+                        figsize=(6, 4),
+                        fig=self.figure,
+                        datetime_format='%H:%M',
+                        tight_layout=True)
+                
+            except Exception as e:
+                # 如果mplfinance失敗，回退到簡單折線圖
+                ax = self.figure.add_subplot(111)
+                ax.grid(True, linestyle=":", linewidth=0.5)
+                ax.set_xlabel("Time")
+                ax.set_ylabel("Price")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                
+                if 'close' in df.columns:
+                    ax.plot(df.index, df['close'], linewidth=1.2, color='blue')
+                    ax.set_title(f"{symbol} - {period} (Close Price)")
+                else:
+                    ax.set_title(f"{symbol} - {period} No Data")
+                
+                # 為折線圖也添加布局調整
+                self.figure.tight_layout(pad=2.0)
+        else:
+            # 沒有數據時顯示提示
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, f"{symbol} - {period}\nNo K-line Data", 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_title(f"{symbol} - {period} No Data")
+        
+        # 調整圖形布局，確保x軸標題不被覆蓋
+        self.figure.tight_layout(pad=3.0)
+        self.figure.subplots_adjust(bottom=0.15)  # 為x軸標題留出更多空間
+        self.figure.autofmt_xdate()
+        self.canvas.draw_idle()
+
+    def update_change_column(self):
+        # 針對每個標的，計算相對 30 分鐘前的漲幅百分比
+        if not self.inst_ids:
+            return
+        now = datetime.datetime.now()
+        threshold = now - datetime.timedelta(minutes=30)
+        for row, inst in enumerate(self.inst_ids):
+            series = self.histories.get(inst, [])
+            if not series or len(series) < 2:
+                self.table.setItem(row, 2, QtWidgets.QTableWidgetItem("N/A"))
+                continue
+            # 取得當前價
+            _, current_val = series[-1]
+            # 尋找最接近且不晚於 threshold 的舊資料
+            baseline_val = None
+            last_before_or_at = None
+            for t, v in series:
+                if t <= threshold:
+                    last_before_or_at = v
+                else:
+                    break
+            if last_before_or_at is not None:
+                baseline_val = last_before_or_at
+            else:
+                # 若沒有早於閾值的資料，則以最早一筆作為基準（資料不足 30 分鐘）
+                baseline_val = series[0][1]
+            try:
+                pct = None
+                if baseline_val and baseline_val > 0:
+                    pct = (current_val - baseline_val) / baseline_val * 100.0
+                    text = f"{pct:+.2f}%"
+                else:
+                    text = "N/A"
+            except Exception:
+                text = "N/A"
+                pct = None
+            item = self.table.item(row, 2)
+            if item is None:
+                item = QtWidgets.QTableWidgetItem()
+                self.table.setItem(row, 2, item)
+            item.setText(text)
+            # 顏色標示與提醒
+            default_bg = QtGui.QBrush()
+            if pct is None:
+                item.setBackground(default_bg)
+                continue
+            abs_threshold = self.alertThreshold.value()
+            triggered = abs(pct) >= abs_threshold
+            if triggered:
+                color = QtGui.QColor(220, 20, 60) if pct < 0 else QtGui.QColor(0, 128, 0)
+                item.setBackground(QtGui.QBrush(color).color())
+                self._maybe_alert(inst, pct)
+            else:
+                item.setBackground(default_bg)
+
+    def _maybe_alert(self, inst: str, pct: float):
+        if not self.alertEnable.isChecked():
+            return
+        now = datetime.datetime.now()
+        last_at = self._lastAlertAt.get(inst)
+        if last_at and (now - last_at) < datetime.timedelta(minutes=self._alertCooldownMinutes):
+            return
+        self._lastAlertAt[inst] = now
+        try:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Price Alert",
+                f"{inst} 30-minute change reached {pct:+.2f}%"
+            )
+        except Exception:
+            pass
+
+    # 已移除：持倉查詢執行緒
+
+    def on_results(self, results: Dict[str, Optional[str]]):
+        for row, inst in enumerate(self.inst_ids):
+            price = results.get(inst)
+            self.table.setItem(row, 1, QtWidgets.QTableWidgetItem(price if price is not None else "N/A"))
+            # 更新歷史
+            try:
+                if price is not None:
+                    now = datetime.datetime.now()
+                    self.histories.setdefault(inst, []).append((now, float(price)))
+                    if len(self.histories[inst]) > 200:
+                        self.histories[inst] = self.histories[inst][-200:]
+            except Exception:
+                pass
+        self.statusLabel.setText("Complete")
+        self.refreshBtn.setEnabled(True)
+        self.update_change_column()
+        self.draw_plot()
+
+    def on_failed(self, err: str):
+        self.statusLabel.setText(f"Error: {err}")
+        self.refreshBtn.setEnabled(True)
+
+    # ===== 新增：持倉回調，更新 UPL 與 UPL Ratio 欄位 =====
+    def on_positions(self, by_inst: Dict[str, dict]):
+        # 嘗試用表中顯示的交易對去對應返回的 instId（SWAP 產品為三段）
+        inst_map: Dict[str, tuple] = {}
+        for row, inst in enumerate(self.inst_ids):
+            # 優先匹配完全相同的鍵
+            if inst in by_inst:
+                inst_map[inst] = (row, inst)
+                continue
+            # 退而求其次：BTC-USDT 對 BTC-USDT-SWAP / FUTURES 進行模糊匹配
+            for key in by_inst.keys():
+                if key.startswith(inst + "-"):
+                    inst_map[inst] = (row, key)
+                    break
+
+        for inst, (row, key) in inst_map.items():
+            pos = by_inst.get(key, {})
+            upl = pos.get("upl")
+            uplRatio = pos.get("uplRatio")
+            try:
+                upl_text = f"{float(upl):.4f}" if upl is not None else "N/A"
+            except Exception:
+                upl_text = "N/A"
+            try:
+                ratio_text = f"{float(uplRatio)*100:.2f}%" if uplRatio is not None else "N/A"
+            except Exception:
+                ratio_text = "N/A"
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem(upl_text))
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem(ratio_text))
+
+    def on_positions_failed(self, err: str):
+        # 無權限或未設置金鑰時，將 UPL 欄位標記為 N/A
+        for row, _ in enumerate(self.inst_ids):
+            self.table.setItem(row, 3, QtWidgets.QTableWidgetItem("N/A"))
+            self.table.setItem(row, 4, QtWidgets.QTableWidgetItem("N/A"))
 
     def draw_plot(self):
         if not self.inst_ids:
