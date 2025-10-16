@@ -61,3 +61,20 @@ def get_ticker(inst_id: str) -> Dict[str, Any]:
     return http_get(path, params=params, auth=False)
 
 
+def get_candlesticks(inst_id: str, bar: str = "1m", limit: int = 100) -> Dict[str, Any]:
+    """
+    獲取K線數據
+    Args:
+        inst_id: 交易對ID，如 "BTC-USDT"
+        bar: K線週期，可選值: 1m, 3m, 5m, 15m, 30m, 1H, 2H, 4H, 6H, 12H, 1D, 1W, 1M, 3M
+        limit: 返回數據條數，最大100
+    """
+    path = "/api/v5/market/candles"
+    params = {
+        "instId": inst_id,
+        "bar": bar,
+        "limit": str(limit)
+    }
+    return http_get(path, params=params, auth=False)
+
+

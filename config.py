@@ -12,4 +12,8 @@ USE_SIMULATED_TRADING = os.getenv("OKX_SIMULATED", "0") == "1"
 # GUI 自動刷新間隔（毫秒）
 GUI_REFRESH_INTERVAL_MS = 60_000
 
+# 時區設定（用於K線圖時間顯示）
+# 可選時區: 'Asia/Taipei', 'Asia/Shanghai', 'Asia/Hong_Kong', 'UTC', 'America/New_York' 等
+TIMEZONE = 'Asia/Taipei'
+
 

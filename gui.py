@@ -1,15 +1,17 @@
 import os
 import datetime
+import pandas as pd
 from typing import Any, Optional, Dict
 
 from PyQt5 import QtWidgets, QtCore, QtGui
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 import matplotlib.dates as mdates
+import mplfinance as mpf
 
 from items import read_item_file
-from okx_api import get_ticker
-from config import GUI_REFRESH_INTERVAL_MS
+from okx_api import get_ticker, get_candlesticks
+from config import GUI_REFRESH_INTERVAL_MS, TIMEZONE
 
 
 def get_prices_for_items(inst_ids: Any) -> Dict[str, Optional[str]]:
@@ -22,6 +24,42 @@ def get_prices_for_items(inst_ids: Any) -> Dict[str, Optional[str]]:
         except Exception:
             results[inst_id] = None
     return results
+
+
+def get_candlestick_data(inst_id: str, bar: str = "1m", limit: int = 100) -> Optional[pd.DataFrame]:
+    """
+    獲取K線數據並轉換為DataFrame格式
+    """
+    try:
+        data = get_candlesticks(inst_id, bar, limit)
+        if not data.get("data"):
+            return None
+        
+        # OKX K線數據格式: [timestamp, open, high, low, close, volume, ...]
+        df = pd.DataFrame(data["data"], columns=[
+            "timestamp", "open", "high", "low", "close", "volume", 
+            "volCcy", "volCcyQuote", "confirm"
+        ])
+        
+        # 轉換數據類型
+        # 將時間戳轉換為UTC時間，然後轉換為配置的時區
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+        # 轉換為配置的時區
+        df["timestamp"] = df["timestamp"].dt.tz_convert(TIMEZONE)
+        # 移除時區信息，保留本地時間
+        df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+        for col in ["open", "high", "low", "close", "volume"]:
+            df[col] = pd.to_numeric(df[col])
+        
+        # 設置時間戳為索引
+        df.set_index("timestamp", inplace=True)
+        
+        # 只保留OHLCV數據
+        df = df[["open", "high", "low", "close", "volume"]]
+        
+        return df
+    except Exception:
+        return None
 
 
 class PriceWorker(QtCore.QThread):
@@ -43,45 +81,54 @@ class PriceWorker(QtCore.QThread):
 class PriceWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("OKX 行情查詢")
-        self.resize(720, 560)
+        self.setWindowTitle("OKX Market Data")
+        self.resize(720, 620)
 
         central = QtWidgets.QWidget(self)
         self.setCentralWidget(central)
 
         self.table = QtWidgets.QTableWidget(self)
         self.table.setColumnCount(3)
-        self.table.setHorizontalHeaderLabels(["交易對", "最新價", "30分漲幅"])
+        self.table.setHorizontalHeaderLabels(["Symbol", "Price", "30m Change"])
         self.table.horizontalHeader().setStretchLastSection(True)
 
-        self.refreshBtn = QtWidgets.QPushButton("重新整理", self)
-        self.statusLabel = QtWidgets.QLabel("就緒", self)
+        self.refreshBtn = QtWidgets.QPushButton("Refresh", self)
+        self.statusLabel = QtWidgets.QLabel("Ready", self)
 
         # 圖表區
-        self.figure = Figure(figsize=(5, 3))
+        self.figure = Figure(figsize=(6, 4))
         self.canvas = FigureCanvas(self.figure)
-        self.ax = self.figure.add_subplot(111)
-        self.ax.grid(True, linestyle=":", linewidth=0.5)
-        self.ax.set_xlabel("time")
-        self.ax.set_ylabel("price")
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+        # 初始化時不創建ax，在draw_plot中動態創建
 
         # 圖表標的一覽
-        self.symbolLabel = QtWidgets.QLabel("圖表標的:")
+        self.symbolLabel = QtWidgets.QLabel("Symbol:")
         self.symbolSelect = QtWidgets.QComboBox()
+        
+        # K線週期選擇
+        self.periodLabel = QtWidgets.QLabel("Period:")
+        self.periodSelect = QtWidgets.QComboBox()
+        self.periodSelect.addItems(["1m", "3m", "5m", "15m", "30m", "1H", "2H", "4H", "6H", "12H", "1D"])
+        self.periodSelect.setCurrentText("1m")
+        
+        # 時區顯示
+        self.timezoneLabel = QtWidgets.QLabel(f"Timezone: {TIMEZONE}")
+        self.timezoneLabel.setStyleSheet("color: gray; font-size: 10px;")
 
         vbox = QtWidgets.QVBoxLayout()
         vbox.addWidget(self.table)
         chartCtl = QtWidgets.QHBoxLayout()
         chartCtl.addWidget(self.symbolLabel)
         chartCtl.addWidget(self.symbolSelect)
+        chartCtl.addWidget(self.periodLabel)
+        chartCtl.addWidget(self.periodSelect)
         chartCtl.addStretch(1)
+        chartCtl.addWidget(self.timezoneLabel)
         vbox.addLayout(chartCtl)
         vbox.addWidget(self.canvas)
 
         # 提醒控制區
         alertCtl = QtWidgets.QHBoxLayout()
-        self.alertEnable = QtWidgets.QCheckBox("啟用漲幅提醒")
+        self.alertEnable = QtWidgets.QCheckBox("Enable Price Alert")
         self.alertEnable.setChecked(False)
         self.alertThreshold = QtWidgets.QDoubleSpinBox()
         self.alertThreshold.setDecimals(2)
@@ -89,7 +136,7 @@ class PriceWindow(QtWidgets.QMainWindow):
         self.alertThreshold.setRange(0.00, 10000.00)
         self.alertThreshold.setValue(2.00)
         alertCtl.addWidget(self.alertEnable)
-        alertCtl.addWidget(QtWidgets.QLabel("閾值"))
+        alertCtl.addWidget(QtWidgets.QLabel("Threshold"))
         alertCtl.addWidget(self.alertThreshold)
         alertCtl.addStretch(1)
 
@@ -110,6 +157,7 @@ class PriceWindow(QtWidgets.QMainWindow):
 
         self.refreshBtn.clicked.connect(self.refresh)
         self.symbolSelect.currentIndexChanged.connect(self.draw_plot)
+        self.periodSelect.currentIndexChanged.connect(self.draw_plot)
 
         # 每分鐘自動刷新
         self.timer = QtCore.QTimer(self)
@@ -134,7 +182,7 @@ class PriceWindow(QtWidgets.QMainWindow):
             self.table.setItem(row, 2, QtWidgets.QTableWidgetItem("-"))
 
     def _init_plot_state(self):
-        # 歷史緩存: {inst_id: list[tuple[datetime, float]]}
+        # 歷史緩存: {inst_id: list[tuple[datetime, float]]} - 保留用於漲幅計算
         self.histories: Dict[str, list] = {inst: [] for inst in self.inst_ids}
         self.symbolSelect.clear()
         self.symbolSelect.addItems(self.inst_ids)
@@ -142,10 +190,10 @@ class PriceWindow(QtWidgets.QMainWindow):
 
     def refresh(self):
         if not self.inst_ids:
-            self.statusLabel.setText("item.txt 無交易對")
+            self.statusLabel.setText("No trading pairs in item.txt")
             return
         self.refreshBtn.setEnabled(False)
-        self.statusLabel.setText("查詢中...")
+        self.statusLabel.setText("Querying...")
         self.worker = PriceWorker(self.inst_ids)
         self.worker.finished.connect(self.on_results)
         self.worker.failed.connect(self.on_failed)
@@ -164,13 +212,13 @@ class PriceWindow(QtWidgets.QMainWindow):
                         self.histories[inst] = self.histories[inst][-200:]
             except Exception:
                 pass
-        self.statusLabel.setText("完成")
+        self.statusLabel.setText("Complete")
         self.refreshBtn.setEnabled(True)
         self.update_change_column()
         self.draw_plot()
 
     def on_failed(self, err: str):
-        self.statusLabel.setText(f"錯誤: {err}")
+        self.statusLabel.setText(f"Error: {err}")
         self.refreshBtn.setEnabled(True)
 
     def draw_plot(self):
@@ -179,20 +227,55 @@ class PriceWindow(QtWidgets.QMainWindow):
         symbol = self.symbolSelect.currentText() if self.symbolSelect.count() else None
         if not symbol:
             return
-        series = self.histories.get(symbol, [])
-        self.ax.clear()
-        self.ax.grid(True, linestyle=":", linewidth=0.5)
-        self.ax.set_xlabel("time")
-        self.ax.set_ylabel("price")
-        self.ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
-        if series:
-            xs = [t for t, _ in series]
-            ys = [v for _, v in series]
-            self.ax.plot(xs, ys, marker="o", linewidth=1.2)
-            self.ax.set_title(f"{symbol}")
-            self.figure.autofmt_xdate()
+        
+        period = self.periodSelect.currentText()
+        
+        # 清除當前圖形
+        self.figure.clear()
+        
+        # 獲取K線數據
+        df = get_candlestick_data(symbol, period, 100)
+        
+        if df is not None and not df.empty:
+            # 使用mplfinance繪製K線圖
+            try:
+                # 使用mplfinance繪製K線圖到當前figure
+                mpf.plot(df, type='candle', style='charles', 
+                        title=f"{symbol} - {period} Candlestick Chart ({TIMEZONE})",
+                        ylabel="Price (USDT)",
+                        volume=True,
+                        figsize=(6, 4),
+                        fig=self.figure,
+                        datetime_format='%H:%M',
+                        tight_layout=True)
+                
+            except Exception as e:
+                # 如果mplfinance失敗，回退到簡單折線圖
+                ax = self.figure.add_subplot(111)
+                ax.grid(True, linestyle=":", linewidth=0.5)
+                ax.set_xlabel("Time")
+                ax.set_ylabel("Price")
+                ax.xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+                
+                if 'close' in df.columns:
+                    ax.plot(df.index, df['close'], linewidth=1.2, color='blue')
+                    ax.set_title(f"{symbol} - {period} (Close Price)")
+                else:
+                    ax.set_title(f"{symbol} - {period} No Data")
+                
+                # 為折線圖也添加布局調整
+                self.figure.tight_layout(pad=2.0)
         else:
-            self.ax.set_title(f"{symbol} 無資料")
+            # 沒有數據時顯示提示
+            ax = self.figure.add_subplot(111)
+            ax.text(0.5, 0.5, f"{symbol} - {period}\nNo K-line Data", 
+                   ha='center', va='center', transform=ax.transAxes, fontsize=12)
+            ax.set_title(f"{symbol} - {period} No Data")
+        
+        # 調整圖形布局，確保x軸標題不被覆蓋
+        self.figure.tight_layout(pad=3.0)
+        self.figure.subplots_adjust(bottom=0.15)  # 為x軸標題留出更多空間
+        self.figure.autofmt_xdate()
         self.canvas.draw_idle()
 
     def update_change_column(self):
@@ -261,8 +344,8 @@ class PriceWindow(QtWidgets.QMainWindow):
         try:
             QtWidgets.QMessageBox.information(
                 self,
-                "漲幅提醒",
-                f"{inst} 30 分漲幅達到 {pct:+.2f}%"
+                "Price Alert",
+                f"{inst} 30-minute change reached {pct:+.2f}%"
             )
         except Exception:
             pass
