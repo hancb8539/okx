@@ -1,0 +1,4 @@
+# 一行一個交易對，支援註解與空行
+BTC-USDT
+ETH-USDT
+SUI-USDT
